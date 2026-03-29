@@ -1,0 +1,521 @@
+# -*- coding: utf-8 -*-
+# ANALISADOR_FILTROS_V1.5 - Ferramenta para análise de filtros e sistemas de controle.
+#
+#   Esta ferramenta permite a entrada de uma função de transferência de três
+#   formas distintas:
+#   1. Coeficientes do numerador e denominador.
+#   2. Zeros, polos e ganho k.
+#   3. Expressão simbólica em 's'.
+#
+#   Funcionalidades Principais:
+#   - **Detecção Automática de Filtro:** Classifica o sistema como Passa-Baixas,
+#     Passa-Altas, Passa-Banda ou Rejeita-Banda.
+#   - **Cálculo de Parâmetros:** Determina frequências de corte, frequência central,
+#     largura de banda, fator Q e a largura de banda de -3dB (estilo MATLAB).
+#   - **Visualização Completa com Proporção 1:1:** Gera três gráficos interligados.
+#     O gráfico do Plano-s agora mantém uma proporção 1:1 para uma visualização correta.
+#   - **Interface Gráfica Moderna:** Utiliza uma interface com tema escuro
+#     para melhor visualização e organização das informações.
+#   - **Faixa de Frequência Adaptativa:** Ajusta o range do diagrama de Bode
+#     para focar na região de interesse do sistema.
+#   - **Exportação de Gráficos:** Permite salvar cada gráfico individualmente como um arquivo PNG.
+#
+# Requisitos:
+#   pip install numpy matplotlib sympy scipy
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from sympy import symbols, sympify, Poly, fraction
+from scipy.signal import zpk2tf, tf2zpk, freqs
+from scipy.optimize import fsolve
+import warnings
+import os
+
+
+# --- Funções Utilitárias ---
+
+def poly2str_custom(coeffs, var='s'):
+    """ Converte um vetor de coeficientes de polinômio em uma string formatada. """
+    if not hasattr(coeffs, '__iter__'): return "0"
+    coeffs = [c for c in coeffs if abs(c) > 1e-12]
+    if not coeffs: return "0"
+
+    s = symbols(var)
+    poly = Poly(coeffs, s)
+    return str(poly.as_expr()).replace('**', '^')
+
+
+def parse_vector(txt, field_name):
+    """ Converte uma string em um array numpy de números complexos. """
+    if not txt.strip(): return np.array([])
+    try:
+        txt = txt.replace('[', '').replace(']', '').replace(',', ' ')
+        return np.array([complex(v) for v in txt.split()], dtype=np.complex128)
+    except (ValueError, TypeError):
+        raise ValueError(f"Entrada inválida em '{field_name}'. Use formato MATLAB, ex: [1 -2+3j -2-3j]")
+
+
+def strip_leading_zeros(v):
+    """ Remove zeros à esquerda de um vetor de coeficientes. """
+    v_arr = np.array(v)
+    if np.all(np.abs(v_arr) < 1e-14): return np.array([0.0])
+    idx = np.argmax(np.abs(v_arr) > 1e-14)
+    return v_arr[idx:]
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Transfilytics - Analisador de Filtros e Sistemas")
+        self.root.geometry("1280x820")
+
+        # --- Estilo Dark ---
+        self.root.tk_setPalette(background='#141416', foreground='#ffffff')
+        style = ttk.Style(self.root)
+        style.theme_use('clam')
+        style.configure('.', background='#141416', foreground='#ffffff', fieldbackground='#26262a', bordercolor="#444")
+        style.configure('TFrame', background='#141416')
+        style.configure('TLabel', background='#141416', foreground='#f0f0f0')
+        style.configure('TButton', background='#36363a', foreground='#ffffff', borderwidth=1)
+        style.configure('TEntry', fieldbackground='#26262a', foreground='#ffffff', insertbackground='#fff')
+        style.configure('TLabelframe', background='#141416', bordercolor="#555")
+        style.configure('TLabelframe.Label', background='#141416', foreground='#ffffff', font=('Helvetica', 10, 'bold'))
+        style.configure('TCheckbutton', background='#141416', foreground='#f0f0f0')
+        style.map('TButton', background=[('active', '#4a4a50')])
+        style.configure('Toolbar.TFrame', background='#141416')
+
+        # --- Grid Principal ---
+        self.root.columnconfigure(0, weight=0, minsize=460)
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(root, padding=8)
+        left.grid(row=0, column=0, sticky="nswe")
+        right = ttk.Frame(root, padding=8)
+        right.grid(row=0, column=1, sticky="nswe")
+
+        # --- Lado Esquerdo: Controles ---
+        left.rowconfigure(5, weight=1)
+
+        p1 = ttk.LabelFrame(left, text="1. Entrada por Coeficientes")
+        p1.grid(row=0, column=0, sticky="ew", pady=5);
+        p1.columnconfigure(0, weight=1)
+        ttk.Label(p1, text="Numerador (ex: [2 4 -6]):").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.eNum = ttk.Entry(p1, width=45);
+        self.eNum.grid(row=1, column=0, sticky='ew', padx=5, pady=(0, 5))
+        ttk.Label(p1, text="Denominador (ex: [1 7 -6 -1]):").grid(row=2, column=0, sticky='w', padx=5, pady=2)
+        self.eDen = ttk.Entry(p1, width=45);
+        self.eDen.grid(row=3, column=0, sticky='ew', padx=5, pady=(0, 5))
+
+        p2 = ttk.LabelFrame(left, text="2. Entrada por Zeros, Polos e Ganho")
+        p2.grid(row=1, column=0, sticky="ew", pady=5);
+        p2.columnconfigure(0, weight=1)
+        p2_grid = ttk.Frame(p2);
+        p2_grid.grid(sticky='ew', padx=5, pady=5);
+        p2_grid.columnconfigure(0, weight=1)
+        ttk.Label(p2_grid, text="Zeros (ex: [-1 -2j -2+j]):").grid(row=0, column=0, sticky='w')
+        ttk.Label(p2_grid, text="Ganho (k):").grid(row=0, column=1, sticky='w', padx=5)
+        self.eZ = ttk.Entry(p2_grid);
+        self.eZ.grid(row=1, column=0, sticky='ew')
+        self.eK = ttk.Entry(p2_grid, width=10);
+        self.eK.grid(row=1, column=1, sticky='w', padx=5);
+        self.eK.insert(0, '1')
+        ttk.Label(p2_grid, text="Polos (ex: [-3 -4-5j -4+5j]):").grid(row=2, column=0, columnspan=2, sticky='w',
+                                                                      pady=(5, 0))
+        self.eP = ttk.Entry(p2_grid);
+        self.eP.grid(row=3, column=0, columnspan=2, sticky='ew')
+
+        p3 = ttk.LabelFrame(left, text="3. Entrada por Expressão Simbólica")
+        p3.grid(row=2, column=0, sticky="ew", pady=5);
+        p3.columnconfigure(0, weight=1)
+        ttk.Label(p3, text="Função G(s) (ex: 1000/(s+1000)):").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.eSym = ttk.Entry(p3);
+        self.eSym.grid(row=1, column=0, sticky='ew', padx=5, pady=(0, 5))
+
+        pEx = ttk.LabelFrame(left, text="Exemplos Rápidos")
+        pEx.grid(row=3, column=0, sticky="ew", pady=5)
+        ex_grid = ttk.Frame(pEx);
+        ex_grid.grid(padx=5, pady=5)
+        ttk.Button(ex_grid, text="Passa-Baixas", command=lambda: self.set_example('lpf')).grid(row=0, column=0, padx=2,
+                                                                                               pady=2)
+        ttk.Button(ex_grid, text="Passa-Altas", command=lambda: self.set_example('hpf')).grid(row=0, column=1, padx=2,
+                                                                                              pady=2)
+        ttk.Button(ex_grid, text="Passa-Banda", command=lambda: self.set_example('bpf')).grid(row=1, column=0, padx=2,
+                                                                                              pady=2)
+        ttk.Button(ex_grid, text="Rejeita-Banda", command=lambda: self.set_example('notch')).grid(row=1, column=1,
+                                                                                                  padx=2, pady=2)
+
+        pOpt = ttk.Frame(left);
+        pOpt.grid(row=4, column=0, sticky='ew', pady=5)
+        self.cbCompareBW = tk.BooleanVar(value=True)
+        ttk.Checkbutton(pOpt, text="Comparar com bandwidth()", variable=self.cbCompareBW).pack(side='left', padx=5)
+        self.cbMark0dB = tk.BooleanVar(value=True)
+        ttk.Checkbutton(pOpt, text="Marcar 0 dB", variable=self.cbMark0dB).pack(side='left', padx=5)
+
+        pRes = ttk.LabelFrame(left, text="Resultados da Análise")
+        pRes.grid(row=5, column=0, sticky="nsew", pady=5);
+        pRes.rowconfigure(0, weight=1);
+        pRes.columnconfigure(0, weight=1)
+        self.outTxt = tk.Text(pRes, wrap="word", background="#1a1a1c", foreground="#f0f0f0", font=("Consolas", 10),
+                              borderwidth=0, highlightthickness=0)
+        self.outTxt.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+
+        btn_grid = ttk.Frame(left);
+        btn_grid.grid(row=6, column=0, sticky='ew', pady=(10, 0));
+        btn_grid.columnconfigure((0, 1, 2), weight=1)
+        ttk.Button(btn_grid, text="Analisar Sistema", command=self.run_analysis, style="Accent.TButton").grid(row=0,
+                                                                                                              column=0,
+                                                                                                              sticky='ew',
+                                                                                                              padx=(
+                                                                                                                  0, 5))
+        ttk.Button(btn_grid, text="Salvar Gráficos", command=self.save_plots).grid(row=0, column=1, sticky='ew',
+                                                                                   padx=(0, 5))
+        ttk.Button(btn_grid, text="Limpar Tudo", command=self.limpar).grid(row=0, column=2, sticky='ew')
+
+        style.configure("Accent.TButton", background='#0078d4', font=('Helvetica', 10, 'bold'));
+        style.map("Accent.TButton", background=[('active', '#005a9e')])
+
+        # --- Lado Direito: Gráficos e Barra de Ferramentas ---
+        right.rowconfigure(0, weight=1);
+        right.columnconfigure(0, weight=1)
+        # MUDANÇA: Removido 'constrained_layout=True' para permitir que o subplot tool funcione
+        self.fig = Figure(figsize=(8, 8), facecolor="#141416")
+
+        gs = self.fig.add_gridspec(3, 1, height_ratios=[1, 1, 2.5])
+        self.axMag = self.fig.add_subplot(gs[0])
+        self.axPhase = self.fig.add_subplot(gs[1])
+        self.axPZ = self.fig.add_subplot(gs[2])
+
+        # MUDANÇA: Usar tight_layout para um bom espaçamento inicial
+        self.fig.tight_layout(pad=3.0)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right);
+        self.canvas_widget = self.canvas.get_tk_widget();
+        self.canvas_widget.grid(row=0, column=0, sticky="nsew")
+        toolbar_frame = ttk.Frame(right, style='Toolbar.TFrame');
+        toolbar_frame.grid(row=1, column=0, sticky="ew")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame);
+        self.toolbar.config(background='#141416');
+        self.toolbar._message_label.config(background='#141416', foreground='#ffffff')
+        for button in self.toolbar.winfo_children(): button.config(background='#141416')
+
+        self.set_dark_axes(self.axMag, 'Diagrama de Bode – Magnitude');
+        self.set_dark_axes(self.axPhase, 'Diagrama de Bode – Fase');
+        self.set_dark_axes(self.axPZ, 'Plano-s (Zeros e Polos)')
+        self.set_example('lpf')
+
+    # --- Lógica Principal ---
+    def run_analysis(self):
+        try:
+            num, den = self.construir_tf()
+            if num is None or den is None: return
+            z, p, k = tf2zpk(num, den)
+            if len(p) > 0 and np.any(np.real(p) >= -1e-9): messagebox.showwarning("Sistema Instável",
+                                                                                  "Atenção: Sistema instável ou marginalmente estável (polos em Re(s)≥0).")
+            if len(strip_leading_zeros(num)) > len(strip_leading_zeros(den)): messagebox.showwarning(
+                "Sistema Impróprio", "Sistema impróprio (grau do numerador > grau do denominador).")
+
+            w, wmin, wmax = self.faixa_freq_adaptativa(z, p)
+            res = self.analisar_filtro(num, den, w)
+            self.plotar_resultados(res, wmin, wmax)
+            self.display_results(res)
+        except Exception as e:
+            messagebox.showerror("Erro na Análise", f"Ocorreu um erro:\n{str(e)}")
+
+    def analisar_filtro(self, num, den, w):
+        res = {}
+        w_resp, h = freqs(num, den, worN=w)
+        res['mag'] = np.abs(h);
+        res['phase'] = np.unwrap(np.angle(h)) * 180 / np.pi
+        z, p, k = tf2zpk(num, den)
+        res['z'], res['p'], res['k'] = z, p, k;
+        res['num'], res['den'] = num, den
+        res['degNum'] = len(strip_leading_zeros(num)) - 1;
+        res['degDen'] = len(strip_leading_zeros(den)) - 1
+
+        G0_db = 20 * np.log10(abs(freqs(num, den, worN=[1e-9])[1][0]))
+        Ginf_db = 20 * np.log10(abs(freqs(num, den, worN=[w[-1]])[1][0]))
+        magPico_db, idx_pico = max(zip(20 * np.log10(res['mag']), range(len(w))))
+        res['ganhoPico'] = 10 ** (magPico_db / 20);
+        res['wPico'] = w[idx_pico]
+
+        db_thresh = 10
+        if G0_db > magPico_db - db_thresh and Ginf_db < magPico_db - db_thresh:
+            res['tipo'], ganho_ref = 'Passa-Baixas (LPF)', abs(freqs(num, den, worN=[1e-9])[1][0])
+        elif Ginf_db > magPico_db - db_thresh and G0_db < magPico_db - db_thresh:
+            res['tipo'], ganho_ref = 'Passa-Altas (HPF)', abs(freqs(num, den, worN=[w[-1]])[1][0])
+        elif G0_db < magPico_db - db_thresh and Ginf_db < magPico_db - db_thresh:
+            res['tipo'], ganho_ref = 'Passa-Banda (BPF)', res['ganhoPico']
+        elif G0_db > magPico_db - db_thresh and Ginf_db > magPico_db - db_thresh and magPico_db < (
+                G0_db - db_thresh / 2):
+            res['tipo'], ganho_ref = 'Rejeita-Banda (BSF)', abs(freqs(num, den, worN=[1e-9])[1][0])
+        else:
+            res['tipo'], ganho_ref = 'Tipo Indefinido', res['ganhoPico']
+
+        mag_alvo = ganho_ref / np.sqrt(2)
+        res['wc'] = self.find_cutoff_frequencies(num, den, w, res['mag'], mag_alvo)
+        res['fc'] = res['wc'] / (2 * np.pi)
+
+        G0 = abs(freqs(num, den, worN=[1e-9])[1][0])
+        if G0 > 1e-9:
+            bw_target_mag = G0 / np.sqrt(2)
+            bw_candidates = self.find_cutoff_frequencies(num, den, w, res['mag'], bw_target_mag)
+            res['bandwidth'] = bw_candidates[0] if len(bw_candidates) > 0 else np.nan
+        else:
+            res['bandwidth'] = np.nan
+
+        res['f0'], res['w0'], res['BW_Hz'], res['BW_rad'], res['Q'] = (np.nan,) * 5
+        if len(res['wc']) == 2:
+            res['w0'] = np.sqrt(res['wc'][0] * res['wc'][1]);
+            res['f0'] = res['w0'] / (2 * np.pi)
+            res['BW_rad'] = res['wc'][1] - res['wc'][0];
+            res['BW_Hz'] = res['fc'][1] - res['fc'][0]
+            res['Q'] = res['w0'] / res['BW_rad'] if res['BW_rad'] > 1e-9 else np.inf
+        return res
+
+    def plotar_resultados(self, res, wmin, wmax):
+        for ax in [self.axMag, self.axPhase, self.axPZ]: ax.cla()
+        self.set_dark_axes(self.axMag, 'Diagrama de Bode – Magnitude');
+        self.set_dark_axes(self.axPhase, 'Diagrama de Bode – Fase');
+        self.set_dark_axes(self.axPZ, 'Plano-s (Zeros e Polos)')
+        w = np.geomspace(wmin, wmax, 10000)
+        w_resp, h = freqs(res['num'], res['den'], worN=w)
+        mag_resp, phase_resp_rad = np.abs(h), np.angle(h)
+
+        self.axMag.semilogx(w, 20 * np.log10(mag_resp), color='#3399FF', linewidth=1.8)
+        self.axMag.set_ylabel('Magnitude (dB)');
+        self.axMag.set_xlabel('Frequência (rad/s)');
+        self.axMag.set_xlim(wmin, wmax)
+        if self.cbMark0dB.get(): self.axMag.axhline(0, linestyle=':', color='#999', label='0 dB')
+
+        cores_corte = ['#cccc00', '#00cccc']
+        for i, wc_val in enumerate(res['wc']):
+            self.axMag.axvline(wc_val, linestyle='-.', color=cores_corte[i % 2], linewidth=1.1)
+            self.axMag.text(wc_val * 1.1, self.axMag.get_ylim()[0], f' fc{i + 1}', color=cores_corte[i % 2],
+                            va='bottom')
+        if not np.isnan(res['ganhoPico']): self.axMag.axhline(20 * np.log10(res['ganhoPico']), linestyle='-.',
+                                                              color='#ff9933', linewidth=1.1)
+
+        if self.cbCompareBW.get() and not np.isnan(res['bandwidth']):
+            self.axMag.axvline(res['bandwidth'], linestyle=':', color='#ff66ff', linewidth=1.2)
+            self.axMag.text(res['bandwidth'], self.axMag.get_ylim()[1], ' bandwidth()', color='#ff66ff', va='top',
+                            ha='right', rotation=90)
+
+        self.axPhase.semilogx(w, np.unwrap(phase_resp_rad) * 180 / np.pi, '--', color='#FFB833', linewidth=1.4)
+        self.axPhase.set_ylabel('Fase (graus)');
+        self.axPhase.set_xlabel('Frequência (rad/s)');
+        self.axPhase.set_xlim(wmin, wmax)
+
+        self.axPZ.axhline(0, color='#666', linestyle=':');
+        self.axPZ.axvline(0, color='#666', linestyle=':')
+        if len(res['z']) > 0: self.axPZ.plot(np.real(res['z']), np.imag(res['z']), 'o', mfc='none', mec='#00ffff', ms=9,
+                                             mew=2.2, label="Zeros")
+        if len(res['p']) > 0: self.axPZ.plot(np.real(res['p']), np.imag(res['p']), 'x', color='#ff4d4d', ms=10, mew=2.2,
+                                             label="Polos")
+        self.axPZ.set_xlabel('Eixo Real (σ)');
+        self.axPZ.set_ylabel('Eixo Imaginário (jω)')
+        if len(res['z']) > 0 or len(res['p']) > 0: self.axPZ.legend(facecolor="#2a2a2c", edgecolor="#444",
+                                                                    labelcolor="#eee")
+        self.fit_plane_limits(self.axPZ, res['z'], res['p'])
+
+        # MUDANÇA: Reaplicar o layout após o plot
+        self.fig.tight_layout(pad=3.0)
+        self.canvas.draw_idle()
+
+    def display_results(self, r):
+        Gstr = f"G(s) = ({poly2str_custom(r['num'], 's')}) / ({poly2str_custom(r['den'], 's')})"
+        zstr = '[]' if len(r['z']) == 0 else np.array2string(r['z'], formatter={
+            'complex_kind': lambda x: f"{x.real:g}{x.imag:+g}j"}, separator=', ')
+        pstr = '[]' if len(r['p']) == 0 else np.array2string(r['p'], formatter={
+            'complex_kind': lambda x: f"{x.real:g}{x.imag:+g}j"}, separator=', ')
+
+        out = [
+            Gstr, "", f"Zeros: {zstr}", f"Polos: {pstr}", "",
+            f"Grau Numerador   = {r['degNum']}", f"Grau Denominador = {r['degDen']}",
+            f"Grau Relativo    = {r['degDen'] - r['degNum']}",
+            '----------------------------------------', f"Tipo de Filtro: {r['tipo']}",
+            f"Pico de Ganho: {r['ganhoPico']:.4g} ({20 * np.log10(r['ganhoPico']):.2f} dB) @ {r['wPico']:.4g} rad/s", ""
+        ]
+        if r['wc'].size > 0:
+            for i, wc_val in enumerate(r['wc']): out.append(
+                f"f_c{i + 1} (-3dB): {r['fc'][i]:.5g} Hz  (ω_c{i + 1} = {wc_val:.5g} rad/s)")
+        else:
+            out.append("Frequência(s) de corte não encontrada(s).")
+
+        if not np.isnan(r['w0']):
+            out.extend(["", f"Frequência Central: {r['f0']:.5g} Hz  (ω₀ = {r['w0']:.5g} rad/s)",
+                        f"Largura de Banda:   {r['BW_Hz']:.5g} Hz  (BW = {r['BW_rad']:.5g} rad/s)",
+                        f"Fator de Qualidade (Q): {r['Q']:.4g}"])
+        self.outTxt.delete("1.0", "end");
+        self.outTxt.insert("1.0", "\n".join(out))
+
+    def construir_tf(self):
+        strSym, strNum, strDen = self.eSym.get().strip(), self.eNum.get().strip(), self.eDen.get().strip()
+        strZ, strP, strK = self.eZ.get().strip(), self.eP.get().strip(), self.eK.get().strip()
+        if strSym:
+            s = symbols('s');
+            expr = sympify(strSym.replace('^', '**'));
+            num_expr, den_expr = fraction(expr.simplify())
+            num = np.array(Poly(num_expr, s).all_coeffs(), dtype=float);
+            den = np.array(Poly(den_expr, s).all_coeffs(), dtype=float)
+            return strip_leading_zeros(num), strip_leading_zeros(den)
+        if strZ or strP:
+            z, p = parse_vector(strZ, 'Zeros'), parse_vector(strP, 'Polos')
+            try:
+                k = float(strK)
+            except:
+                k = 1.0;
+                self.eK.delete(0, 'end');
+                self.eK.insert(0, '1')
+            num, den = zpk2tf(z, p, k);
+            return strip_leading_zeros(num), strip_leading_zeros(den)
+        if strNum and strDen:
+            num, den = parse_vector(strNum, 'Numerador'), parse_vector(strDen, 'Denominador')
+            return strip_leading_zeros(num), strip_leading_zeros(den)
+        raise ValueError("Preencha uma das três seções de entrada para continuar.")
+
+    def limpar(self):
+        for e in [self.eNum, self.eDen, self.eZ, self.eP, self.eSym]: e.delete(0, 'end')
+        self.eK.delete(0, 'end');
+        self.eK.insert(0, '1');
+        self.outTxt.delete('1.0', 'end')
+        for ax in [self.axMag, self.axPhase, self.axPZ]: ax.cla()
+        self.set_dark_axes(self.axMag, 'Diagrama de Bode – Magnitude');
+        self.set_dark_axes(self.axPhase, 'Diagrama de Bode – Fase');
+        self.set_dark_axes(self.axPZ, 'Plano-s (Zeros e Polos)')
+        self.fig.tight_layout(pad=3.0)
+        self.canvas.draw_idle()
+
+    def set_example(self, type):
+        self.limpar()
+        if type == 'lpf':
+            w_c = 2 * np.pi * 1000;
+            self.eSym.insert(0, f"{w_c ** 2:.5g} / (s^2 + {np.sqrt(2) * w_c:.5g}*s + {w_c ** 2:.5g})")
+        elif type == 'hpf':
+            w_c = 2 * np.pi * 500;
+            self.eSym.insert(0, f's^2 / (s^2 + {np.sqrt(2) * w_c:.5g}*s + {w_c ** 2:.5g})')
+        elif type == 'bpf':
+            w0 = 2 * np.pi * 2000;
+            Q = 5;
+            BW = w0 / Q;
+            self.eSym.insert(0, f'({BW:.5g}*s) / (s^2 + {BW:.5g}*s + {w0 ** 2:.5g})')
+        elif type == 'notch':
+            w0 = 2 * np.pi * 60;
+            Q = 30;
+            BW = w0 / Q;
+            self.eSym.insert(0, f'(s^2 + {w0 ** 2:.5g}) / (s^2 + {BW:.5g}*s + {w0 ** 2:.5g})')
+        self.run_analysis()
+
+    def set_dark_axes(self, ax, title):
+        ax.set_facecolor("#1a1a1c");
+        ax.set_title(title, color="#f0f0f0", fontsize=11)
+        ax.tick_params(axis='x', colors="#aaa");
+        ax.tick_params(axis='y', colors="#aaa")
+        for spine in ax.spines.values(): spine.set_color('#555')
+        ax.xaxis.label.set_color('#ddd');
+        ax.yaxis.label.set_color('#ddd')
+        ax.grid(True, color="#333", linestyle='--', linewidth=0.5)
+
+    def find_cutoff_frequencies(self, num, den, w, mag, target_mag):
+        crossings = np.where(np.diff(np.sign(mag - target_mag)))[0]
+        if crossings.size == 0: return np.array([])
+        f_mag = lambda ww: abs(freqs(num, den, worN=[ww])[1][0]) - target_mag
+        w_cortes = []
+        for idx in crossings:
+            w_interval = [w[idx], w[idx + 1]]
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore");
+                    wc = fsolve(f_mag, x0=np.mean(w_interval))[0]
+                if w_interval[0] <= wc <= w_interval[1]: w_cortes.append(wc)
+            except:
+                continue
+        return np.sort(np.unique(w_cortes))
+
+    def faixa_freq_adaptativa(self, z, p, decFolgaHi=4, decFolgaLo=3):
+        zp = np.concatenate([z, p]);
+        w_zp = np.abs(zp[np.isfinite(zp) & (zp != 0)])
+        if w_zp.size == 0:
+            wmin, wmax = 1e-3, 1e7
+        else:
+            wmin0, wmax0 = np.min(w_zp), np.max(w_zp)
+            wmin = 10 ** (np.floor(np.log10(wmin0)) - decFolgaLo);
+            wmax = 10 ** (np.ceil(np.log10(wmax0)) + decFolgaHi)
+            wmin = max(wmin, 1e-9)
+            if wmax <= wmin * 100: wmax = wmin * 100
+        return np.geomspace(wmin, wmax, 10000), wmin, wmax
+
+    def fit_plane_limits(self, ax, z, p):
+        """
+        Ajusta os limites do plano-s para que o gráfico seja sempre quadrado (proporção 1:1),
+        centralizando os polos e zeros e adicionando uma margem.
+        """
+        pts = np.concatenate([z, p])
+        if pts.size == 0:
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect('equal', adjustable='box')
+            return
+
+        real_pts = np.real(pts[np.isfinite(pts)])
+        imag_pts = np.imag(pts[np.isfinite(pts)])
+
+        x_min, x_max = (np.min(real_pts), np.max(real_pts)) if real_pts.size > 0 else (-1, 1)
+        y_min, y_max = (np.min(imag_pts), np.max(imag_pts)) if imag_pts.size > 0 else (-1, 1)
+
+        if x_max - x_min < 1e-6:
+            x_max += 0.5
+            x_min -= 0.5
+        if y_max - y_min < 1e-6:
+            y_max += 0.5
+            y_min -= 0.5
+
+        x_center = (x_max + x_min) / 2
+        y_center = (y_max + y_min) / 2
+        max_range = max(x_max - x_min, y_max - y_min)
+        plot_half_range = max_range * 0.5 * 1.15
+
+        ax.set_xlim(x_center - plot_half_range, x_center + plot_half_range)
+        ax.set_ylim(y_center - plot_half_range, y_center + plot_half_range)
+        ax.set_aspect('equal', adjustable='box')
+
+    # --- NOVA FUNÇÃO ---
+    def save_plots(self):
+        """ Salva os três gráficos como arquivos PNG separados. """
+        path = filedialog.askdirectory(title="Selecione a pasta para salvar os gráficos")
+        if not path:
+            return  # O usuário cancelou
+
+        plots_to_save = {
+            "diagrama_bode_magnitude.png": self.axMag,
+            "diagrama_bode_fase.png": self.axPhase,
+            "plano_s_zeros_polos.png": self.axPZ
+        }
+
+        # Forçar o desenho do canvas para garantir que os renderizadores estejam atualizados
+        self.canvas.draw()
+        renderer = self.fig.canvas.get_renderer()
+
+        try:
+            for filename, ax in plots_to_save.items():
+                # Obter o bounding box (caixa delimitadora) do subplot específico
+                bbox = ax.get_tightbbox(renderer).transformed(self.fig.dpi_scale_trans.inverted())
+                # Adicionar uma pequena margem (padding) para não cortar os títulos
+                bbox_expanded = bbox.expanded(1.05, 1.08)
+
+                filepath = os.path.join(path, filename)
+                # Salvar a figura usando o bounding box para isolar o subplot
+                self.fig.savefig(filepath, bbox_inches=bbox_expanded, dpi=200, facecolor='#141416')
+
+            messagebox.showinfo("Sucesso", f"Gráficos salvos com sucesso em:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar os gráficos.\nErro: {e}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
